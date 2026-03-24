@@ -41,7 +41,7 @@
 1. 安装任意 Userscript 管理器（推荐其一即可）
    - Tampermonkey（Chrome/Edge）
    - Violentmonkey（Firefox/Chrome）
-2. 新建脚本（Create new script），将 `uai_exporter_v132.user.js` 全部内容粘贴进去并保存
+2. 新建脚本（Create new script），将 `ai_exporter_v136.js` 全部内容粘贴进去并保存
 3. 打开任意一条对话页面（ChatGPT / Gemini / Grok），右下角应出现 **Export** 按钮
 
 ---

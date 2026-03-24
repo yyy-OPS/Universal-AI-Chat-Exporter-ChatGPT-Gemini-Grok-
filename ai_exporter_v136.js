@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal AI Chat Exporter （ChatGPT / Gemini / Grok）
 // @namespace    local.only.exporter
-// @version      1.3.2
+// @version      1.3.6
 // @description  Export ChatGPT / Gemini / Grok conversations to Markdown/JSON. Better TeX extraction, multiline math normalization, unified attachment/image fallback scan (all platforms), optional embedded images (data URI, Typora-friendly HTML), UI isolated via Shadow DOM.
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
@@ -67,10 +67,11 @@
     blockMathDelim: "$$",
 
     // 图片
-    embedImagesInMarkdown: false, // data URI 内嵌
-    allowImageFetch: false,       // canvas 失败时允许 fetch 图片（会发起图片请求）
+    embedImagesInMarkdown: true,  // data URI 内嵌
+    allowImageFetch: true,        // canvas 失败时允许 fetch 图片（会发起网络请求）
     maxEmbedImageBytes: 2_500_000,
     dataUriImageMode: "html",     // "md" | "html"（Typora 更兼容 html）
+    packageMarkdownWithAssets: true, // 下载 Markdown 时打包图片为 zip
 
     // ✅ 统一附件/图片兜底策略（ChatGPT / Gemini / Grok）
     attachmentFallbackScan: true,
@@ -81,7 +82,7 @@
     debug: false,
   };
 
-  const LS_KEY = "uai_exporter_settings_v132"; // 新 key：避免旧版本脏配置干扰（也做兼容迁移）
+  const LS_KEY = "uai_exporter_settings_v136"; // 新 key：兼容迁移旧设置，并允许后续独立调整默认值
   let SETTINGS = loadSettings();
 
   const log = (...args) => SETTINGS.debug && console.log("[UAI-Exporter]", ...args);
@@ -89,19 +90,24 @@
 
   function loadSettings() {
     try {
-      const raw132 = localStorage.getItem(LS_KEY);
-      if (raw132) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw132) };
+      const raw136 = localStorage.getItem(LS_KEY);
+      if (raw136) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw136) };
 
-      // 兼容读取 v131（若存在）
-      const raw131 = localStorage.getItem("uai_exporter_settings_v131");
-      if (!raw131) return { ...DEFAULT_SETTINGS };
-      const obj = JSON.parse(raw131);
+      const legacyRaw =
+        localStorage.getItem("uai_exporter_settings_v133") ||
+        localStorage.getItem("uai_exporter_settings_v132") ||
+        localStorage.getItem("uai_exporter_settings_v131");
+      if (!legacyRaw) return { ...DEFAULT_SETTINGS };
+      const obj = JSON.parse(legacyRaw);
 
       // 迁移字段
       if (obj && typeof obj === "object") {
         if (obj.geminiAttachmentFallbackScan !== undefined && obj.attachmentFallbackScan === undefined) {
           obj.attachmentFallbackScan = obj.geminiAttachmentFallbackScan;
         }
+        // v136 延续图片优先内嵌策略；旧配置未显式关闭时沿用当前默认。
+        if (obj.embedImagesInMarkdown === undefined) obj.embedImagesInMarkdown = DEFAULT_SETTINGS.embedImagesInMarkdown;
+        if (obj.allowImageFetch === undefined) obj.allowImageFetch = DEFAULT_SETTINGS.allowImageFetch;
       }
       return { ...DEFAULT_SETTINGS, ...obj };
     } catch {
@@ -144,6 +150,10 @@
 
   function downloadText(filename, text, mime = "text/plain;charset=utf-8") {
     const blob = new Blob([text], { type: mime });
+    downloadBlob(filename, blob);
+  }
+
+  function downloadBlob(filename, blob) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = filename;
@@ -518,6 +528,10 @@
     return (s || "").replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   }
 
+  function escapeRegExp(s) {
+    return (s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
   function getImgSrc(img) {
     if (!img) return "";
     if (img.currentSrc) return img.currentSrc;
@@ -546,7 +560,13 @@
   }
 
   function looksLikeImageUrl(u) {
-    return /\.(png|jpe?g|gif|webp|bmp|svg)(\?.*)?$/i.test(u || "");
+    const s = (u || "").trim();
+    if (!s) return false;
+    if (/^data:image\//i.test(s)) return true;
+    if (/\.(png|jpe?g|gif|webp|bmp|svg)(\?.*)?$/i.test(s)) return true;
+    if (/\/backend-api\/estuary\/content\b/i.test(s)) return true;
+    if (/([?&](format|mime|content[-_]?type)=image(?:%2F|\/)[a-z0-9.+-]+)/i.test(s)) return true;
+    return false;
   }
 
   async function blobToDataURL(blob) {
@@ -556,6 +576,245 @@
       reader.onerror = () => resolve(null);
       reader.readAsDataURL(blob);
     });
+  }
+
+  function parseDataUri(src) {
+    const m = (src || "").match(/^data:([^;,]+)?(?:;charset=[^;,]+)?(;base64)?,(.*)$/i);
+    if (!m) return null;
+    const mime = (m[1] || "application/octet-stream").toLowerCase();
+    const isBase64 = !!m[2];
+    const body = m[3] || "";
+    try {
+      if (isBase64) {
+        const bin = atob(body);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return { mime, bytes };
+      }
+      const text = decodeURIComponent(body);
+      return { mime, bytes: new TextEncoder().encode(text) };
+    } catch {
+      return null;
+    }
+  }
+
+  function inferImageExt(src, mime = "") {
+    const mt = (mime || "").toLowerCase();
+    if (mt.includes("png")) return "png";
+    if (mt.includes("jpeg") || mt.includes("jpg")) return "jpg";
+    if (mt.includes("webp")) return "webp";
+    if (mt.includes("gif")) return "gif";
+    if (mt.includes("bmp")) return "bmp";
+    if (mt.includes("svg")) return "svg";
+
+    const s = (src || "").trim();
+    const extMatch = s.match(/\.([a-z0-9]{2,5})(?:\?|#|$)/i);
+    if (extMatch?.[1]) return extMatch[1].toLowerCase();
+
+    const formatMatch = s.match(/[?&]format=([a-z0-9.+-]+)/i);
+    if (formatMatch?.[1]) return formatMatch[1].toLowerCase().replace(/^image\//, "");
+
+    return "png";
+  }
+
+  async function fetchBinaryAsset(src) {
+    if (!src) return null;
+
+    if (src.startsWith("data:")) {
+      const parsed = parseDataUri(src);
+      if (!parsed) return null;
+      return { bytes: parsed.bytes, mime: parsed.mime };
+    }
+
+    try {
+      const abs = new URL(src, location.href).toString();
+      const resp = await fetch(abs, { mode: "cors", credentials: "include" });
+      if (!resp.ok) return null;
+      const blob = await resp.blob();
+      const buf = await blob.arrayBuffer();
+      return { bytes: new Uint8Array(buf), mime: blob.type || resp.headers.get("content-type") || "" };
+    } catch (e) {
+      log("fetch binary asset failed:", e);
+      return null;
+    }
+  }
+
+  function collectMarkdownImageRefs(markdown) {
+    const refs = [];
+    const mdRe = /!\[([^\]]*)]\(([^)]+)\)/g;
+    let m;
+    while ((m = mdRe.exec(markdown || ""))) {
+      refs.push({ raw: m[0], alt: m[1] || "image", src: (m[2] || "").trim(), kind: "md" });
+    }
+
+    const htmlRe = /<img\s+[^>]*src\s*=\s*["']([^"']+)["'][^>]*>/gi;
+    while ((m = htmlRe.exec(markdown || ""))) {
+      const tag = m[0];
+      const alt = (tag.match(/\balt\s*=\s*["']([^"']*)["']/i)?.[1] || "image").trim();
+      refs.push({ raw: tag, alt, src: (m[1] || "").trim(), kind: "html" });
+    }
+    return refs;
+  }
+
+  function replaceImageRef(markdown, ref, nextPath) {
+    if (!ref?.raw || !nextPath) return markdown;
+    if (ref.kind === "html") {
+      return markdown.replace(ref.raw, ref.raw.replace(/src\s*=\s*["'][^"']+["']/i, `src="${nextPath}"`));
+    }
+    const rawRe = new RegExp(escapeRegExp(ref.raw), "g");
+    return markdown.replace(rawRe, `![${ref.alt}](${nextPath})`);
+  }
+
+  const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+      let c = i;
+      for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      table[i] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) {
+      crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  }
+
+  function dosDateTime(date = new Date()) {
+    const year = Math.max(1980, date.getFullYear());
+    const dosTime = ((date.getHours() & 0x1F) << 11) | ((date.getMinutes() & 0x3F) << 5) | ((Math.floor(date.getSeconds() / 2)) & 0x1F);
+    const dosDate = (((year - 1980) & 0x7F) << 9) | (((date.getMonth() + 1) & 0x0F) << 5) | (date.getDate() & 0x1F);
+    return { dosTime, dosDate };
+  }
+
+  function writeUint16(view, offset, value) {
+    view.setUint16(offset, value & 0xFFFF, true);
+  }
+
+  function writeUint32(view, offset, value) {
+    view.setUint32(offset, value >>> 0, true);
+  }
+
+  function createStoredZip(entries) {
+    const encoder = new TextEncoder();
+    const now = dosDateTime();
+    const localParts = [];
+    const centralParts = [];
+    let offset = 0;
+    const GP_UTF8 = 0x0800;
+
+    for (const entry of entries) {
+      const nameBytes = encoder.encode(entry.name);
+      const dataBytes = entry.bytes instanceof Uint8Array ? entry.bytes : new Uint8Array(entry.bytes || []);
+      const crc = crc32(dataBytes);
+
+      const local = new Uint8Array(30 + nameBytes.length + dataBytes.length);
+      const lv = new DataView(local.buffer);
+      writeUint32(lv, 0, 0x04034b50);
+      writeUint16(lv, 4, 20);
+      writeUint16(lv, 6, GP_UTF8);
+      writeUint16(lv, 8, 0);
+      writeUint16(lv, 10, now.dosTime);
+      writeUint16(lv, 12, now.dosDate);
+      writeUint32(lv, 14, crc);
+      writeUint32(lv, 18, dataBytes.length);
+      writeUint32(lv, 22, dataBytes.length);
+      writeUint16(lv, 26, nameBytes.length);
+      writeUint16(lv, 28, 0);
+      local.set(nameBytes, 30);
+      local.set(dataBytes, 30 + nameBytes.length);
+      localParts.push(local);
+
+      const central = new Uint8Array(46 + nameBytes.length);
+      const cv = new DataView(central.buffer);
+      writeUint32(cv, 0, 0x02014b50);
+      writeUint16(cv, 4, 20);
+      writeUint16(cv, 6, 20);
+      writeUint16(cv, 8, GP_UTF8);
+      writeUint16(cv, 10, 0);
+      writeUint16(cv, 12, now.dosTime);
+      writeUint16(cv, 14, now.dosDate);
+      writeUint32(cv, 16, crc);
+      writeUint32(cv, 20, dataBytes.length);
+      writeUint32(cv, 24, dataBytes.length);
+      writeUint16(cv, 28, nameBytes.length);
+      writeUint16(cv, 30, 0);
+      writeUint16(cv, 32, 0);
+      writeUint16(cv, 34, 0);
+      writeUint16(cv, 36, 0);
+      writeUint32(cv, 38, 0);
+      writeUint32(cv, 42, offset);
+      central.set(nameBytes, 46);
+      centralParts.push(central);
+
+      offset += local.length;
+    }
+
+    const centralSize = centralParts.reduce((n, part) => n + part.length, 0);
+    const end = new Uint8Array(22);
+    const ev = new DataView(end.buffer);
+    writeUint32(ev, 0, 0x06054b50);
+    writeUint16(ev, 4, 0);
+    writeUint16(ev, 6, 0);
+    writeUint16(ev, 8, entries.length);
+    writeUint16(ev, 10, entries.length);
+    writeUint32(ev, 12, centralSize);
+    writeUint32(ev, 16, offset);
+    writeUint16(ev, 20, 0);
+
+    return new Blob([...localParts, ...centralParts, end], { type: "application/zip" });
+  }
+
+  async function packageMarkdownAsZip(baseTitle, markdown, updateProgress) {
+    let md = markdown || "";
+    const refs = collectMarkdownImageRefs(md);
+    if (!refs.length) {
+      const mdName = `${sanitizeFilename(baseTitle || "conversation")}.md`;
+      return {
+        blob: createStoredZip([{ name: mdName, bytes: new TextEncoder().encode(md) }]),
+        filename: buildFilename(baseTitle, ".zip"),
+      };
+    }
+
+    const unique = new Map();
+    for (const ref of refs) {
+      const key = ref.src;
+      if (!key || unique.has(key)) continue;
+      unique.set(key, { ...ref });
+    }
+
+    const entries = [];
+    const srcToPath = new Map();
+    let index = 1;
+
+    for (const ref of unique.values()) {
+      updateProgress?.(`Packaging images… ${index}/${unique.size}`);
+      const asset = await fetchBinaryAsset(ref.src);
+      if (!asset?.bytes?.length) { index++; continue; }
+
+      const ext = inferImageExt(ref.src, asset.mime);
+      const imgName = `image-${String(index).padStart(3, "0")}.${sanitizeFilename(ext).replace(/\./g, "") || "png"}`;
+      entries.push({ name: imgName, bytes: asset.bytes });
+      srcToPath.set(ref.src, imgName);
+      index++;
+    }
+
+    for (const ref of refs) {
+      const nextPath = srcToPath.get(ref.src);
+      if (!nextPath) continue;
+      md = replaceImageRef(md, ref, nextPath);
+    }
+
+    const mdName = `${sanitizeFilename(baseTitle || "conversation")}.md`;
+    entries.unshift({ name: mdName, bytes: new TextEncoder().encode(md) });
+
+    return {
+      blob: createStoredZip(entries),
+      filename: buildFilename(baseTitle, ".zip"),
+    };
   }
 
   async function imageToDataUri(imgEl, src) {
@@ -846,6 +1105,126 @@
     return out;
   }
 
+  const CODE_BLOCK_BREAK_TAGS = new Set([
+    "div","p","section","article","header","footer","main","aside",
+    "ul","ol","li","table","thead","tbody","tr","td","th"
+  ]);
+
+  function detectCodeLanguage(preEl, codeEl) {
+    const candidates = [
+      codeEl?.getAttribute?.("data-language"),
+      preEl?.getAttribute?.("data-language"),
+      codeEl?.getAttribute?.("data-lang"),
+      preEl?.getAttribute?.("data-lang"),
+      codeEl?.getAttribute?.("data-code-language"),
+      preEl?.getAttribute?.("data-code-language"),
+    ].filter(Boolean);
+
+    const classNames = [
+      (codeEl?.className || "").toString(),
+      (preEl?.className || "").toString(),
+    ];
+    for (const cls of classNames) {
+      const m = cls.match(/language-([a-z0-9_+-]+)/i);
+      if (m?.[1]) candidates.push(m[1]);
+    }
+
+    const labelSelectors = [
+      "[data-language]",
+      "[data-code-language]",
+      "[class*='language-']",
+      "[class*='lang-']",
+      "[class*='code-block-language']",
+    ];
+    for (const sel of labelSelectors) {
+      const el = preEl?.querySelector?.(sel);
+      const v =
+        el?.getAttribute?.("data-language") ||
+        el?.getAttribute?.("data-code-language") ||
+        el?.textContent;
+      if (v && v.trim()) candidates.push(v.trim());
+    }
+
+    for (const raw of candidates) {
+      const lang = (raw || "").trim().replace(/^language[-:\s]*/i, "");
+      if (/^[a-z0-9_+#.+-]{1,24}$/i.test(lang)) return lang;
+    }
+    return "";
+  }
+
+  function isLikelyCodeUiLine(line, lang) {
+    const t = (line || "").trim();
+    if (!t) return false;
+    if (/^(copy|copy code|copied|wrap lines|show more|show less)$/i.test(t)) return true;
+    if (/^(复制|复制代码|已复制|换行显示|显示更多|收起)$/i.test(t)) return true;
+    if (lang && t.toLowerCase() === lang.toLowerCase()) return true;
+    return false;
+  }
+
+  function cleanupExtractedCodeText(text, lang) {
+    let t = (text || "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
+    let lines = t.split("\n");
+
+    while (lines.length && !lines[0].trim()) lines.shift();
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+
+    if (lines.length && isLikelyCodeUiLine(lines[0], lang)) lines.shift();
+    if (lines.length && isLikelyCodeUiLine(lines[0], lang)) lines.shift();
+
+    lines = lines.filter((line, idx) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (idx === 0 && lang && trimmed.toLowerCase() === lang.toLowerCase()) return false;
+      return !isLikelyCodeUiLine(trimmed, "");
+    });
+
+    t = lines.join("\n");
+    t = t.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+    return t.trimEnd();
+  }
+
+  function extractCodeTextByStructure(root) {
+    function walk(node, isRoot = false) {
+      if (!node) return "";
+      if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
+      if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+      const el = node;
+      if (!isRoot && shouldSkip(el)) return "";
+
+      const tag = el.tagName.toLowerCase();
+      if (tag === "br") return "\n";
+
+      let out = "";
+      for (const child of el.childNodes) out += walk(child, false);
+
+      const wantsBreak =
+        !isRoot &&
+        (CODE_BLOCK_BREAK_TAGS.has(tag) ||
+         /(^|[-_])(line|row)($|[-_])/i.test((el.className || "").toString()) ||
+         tag.includes("-"));
+
+      if (wantsBreak && out && !out.endsWith("\n")) out += "\n";
+      return out;
+    }
+
+    return walk(root, true);
+  }
+
+  function extractCodeBlock(preEl) {
+    const codeEl = preEl.querySelector("code");
+    const lang = detectCodeLanguage(preEl, codeEl);
+
+    const attempts = [
+      cleanupExtractedCodeText(codeEl?.innerText || preEl.innerText || "", lang),
+      cleanupExtractedCodeText(extractCodeTextByStructure(codeEl || preEl), lang),
+      cleanupExtractedCodeText((codeEl ? codeEl.textContent : preEl.textContent) || "", lang),
+    ];
+
+    const code = attempts.find(Boolean) || "";
+    return { lang, code };
+  }
+
   function nodeToMarkdown(node, ctx, state) {
     if (!node) return "";
     if (node.nodeType === Node.TEXT_NODE) return node.textContent || "";
@@ -892,11 +1271,7 @@
     if (tag === "br") return "\n";
 
     if (tag === "pre") {
-      const codeEl = el.querySelector("code");
-      const cls = (codeEl?.className || "").toString();
-      const m = cls.match(/language-([a-z0-9_+-]+)/i);
-      const lang = m?.[1] || (codeEl?.getAttribute?.("data-language") || "");
-      const code = (codeEl ? codeEl.textContent : el.textContent) || "";
+      const { lang, code } = extractCodeBlock(el);
       return `\n\`\`\`${lang}\n${code.replace(/\n+$/g, "")}\n\`\`\`\n`;
     }
     if (tag === "code") return `\`${escapeMdInline(el.textContent || "")}\``;
@@ -1049,6 +1424,68 @@
     return out;
   }
 
+  function analyzeMarkdownHeadings(md) {
+    const lines = (md || "").split("\n");
+    let inFence = false;
+    let minLevel = Infinity;
+
+    for (const line of lines) {
+      if (/^\s*```/.test(line)) {
+        inFence = !inFence;
+        continue;
+      }
+      if (inFence) continue;
+
+      const m = line.match(/^(#{1,6})\s+/);
+      if (!m) continue;
+      minLevel = Math.min(minLevel, m[1].length);
+    }
+
+    return { hasHeadings: Number.isFinite(minLevel), minLevel };
+  }
+
+  function shiftMarkdownHeadings(md, delta) {
+    if (!delta) return md || "";
+    const lines = (md || "").split("\n");
+    let inFence = false;
+
+    return lines.map((line) => {
+      if (/^\s*```/.test(line)) {
+        inFence = !inFence;
+        return line;
+      }
+      if (inFence) return line;
+
+      const m = line.match(/^(#{1,6})(\s+.*)$/);
+      if (!m) return line;
+      const level = Math.min(6, m[1].length + delta);
+      return `${"#".repeat(level)}${m[2]}`;
+    }).join("\n");
+  }
+
+  function normalizeMessageMarkdown(md) {
+    const info = analyzeMarkdownHeadings(md);
+    if (!info.hasHeadings) return (md || "").trim();
+
+    // 消息容器使用二级标题，因此正文里的最浅标题至少下沉到三级。
+    const delta = Math.max(0, 3 - info.minLevel);
+    return shiftMarkdownHeadings(md, delta).trim();
+  }
+
+  function buildMessageHeading(role, index) {
+    if (SETTINGS.headingStyle === "qa") {
+      return role === "user" ? `## ${index}. Q` : `## ${index}. A`;
+    }
+
+    const roleLabel =
+      role === "user" ? "User" :
+      role === "assistant" ? "Assistant" :
+      role === "system" ? "System" :
+      (role || "Unknown");
+
+    return `## ${index}. ${roleLabel}`;
+  }
+
   async function extractConversation(adapter, platform) {
     const title = adapter.getTitle();
     const url = location.href;
@@ -1080,27 +1517,26 @@
       out += `exported_at: "${ts}"\n`;
       out += `message_count: ${messages.length}\n`;
       out += `---\n\n`;
-    } else {
-      out += `# ${title}\n\n- Platform: ${platform}\n- Exported at: ${ts}\n`;
+    }
+
+    out += `# ${title}\n\n`;
+
+    if (!SETTINGS.includeYamlFrontMatter) {
+      out += `- Platform: ${platform}\n- Exported at: ${ts}\n`;
       if (SETTINGS.includeRawUrl) out += `- Source: ${url}\n`;
       out += `\n`;
     }
 
     if (SETTINGS.includeTOC) {
       out += `## Table of Contents\n`;
-      out += messages.map((m,i)=>`- [${i+1}. ${m.role}](#msg-${i+1})`).join("\n");
+      out += messages.map((m,i)=>`- [${buildMessageHeading(m.role, i+1).replace(/^##\s+/, "")}](#msg-${i+1})`).join("\n");
       out += `\n\n`;
     }
 
-    const roleLabel = (r)=> (r==="user"?"User":(r==="assistant"?"Assistant":(r==="system"?"System":(r||"Unknown"))));
-
     messages.forEach((m,i)=>{
-      const anchor = SETTINGS.includeTOC ? `<a id="msg-${i+1}"></a>\n` : "";
-      if (SETTINGS.headingStyle==="qa") {
-        out += (m.role==="user") ? `${anchor}# Q\n\n${m.md}\n\n` : `${anchor}# A\n\n${m.md}\n\n`;
-      } else {
-        out += `${anchor}## ${roleLabel(m.role)}\n\n${m.md}\n\n`;
-      }
+      const anchor = `<a id="msg-${i+1}"></a>\n`;
+      const body = normalizeMessageMarkdown(m.md);
+      out += `${anchor}${buildMessageHeading(m.role, i+1)}\n\n${body}\n\n`;
     });
 
     if (SETTINGS.compactBlankLines) out = out.replace(/\n{3,}/g,"\n\n");
@@ -1268,6 +1704,7 @@
       panel.appendChild(row(document.createTextNode("data URI 渲染"), makeSelect("dataUriImageMode", [["html","HTML <img>（Typora 友好）"],["md","Markdown ![]()"]])) );
       panel.appendChild(row(makeCheckbox("allowImageFetch","允许 fetch 图片（提高跨域图内嵌成功率）"), null));
     }
+    panel.appendChild(row(makeCheckbox("packageMarkdownWithAssets","下载 Markdown 时打包图片为 ZIP"), null));
 
     panel.appendChild(row(document.createTextNode("标题风格"), makeSelect("headingStyle", [["role","按角色（User/Assistant）"],["qa","按 Q/A"]])));
 
@@ -1344,9 +1781,16 @@
         clearStatus(1200);
       } else {
         const content = buildMarkdownDoc(convo);
-        const filename = buildFilename(convo.title, ".md");
-        updateStatus(`Downloading: ${filename}`);
-        downloadText(filename, content, "text/markdown;charset=utf-8");
+        if (SETTINGS.packageMarkdownWithAssets) {
+          updateStatus("Packaging Markdown + images…");
+          const pkg = await packageMarkdownAsZip(convo.title, content, updateStatus);
+          updateStatus(`Downloading: ${pkg.filename}`);
+          downloadBlob(pkg.filename, pkg.blob);
+        } else {
+          const filename = buildFilename(convo.title, ".md");
+          updateStatus(`Downloading: ${filename}`);
+          downloadText(filename, content, "text/markdown;charset=utf-8");
+        }
         clearStatus(1200);
       }
     } catch(e) {
